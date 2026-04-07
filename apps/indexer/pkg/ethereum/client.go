@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 
+	eth "github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
 )
 
@@ -51,4 +53,8 @@ func (c *evmClient) Close() {
 	if c.wsConn != nil {
 		c.wsConn.Close()
 	}
+}
+
+func (c *evmClient) FilterLogs(ctx context.Context, q eth.FilterQuery) ([]types.Log, error) {
+	return c.httpConn.FilterLogs(ctx, q)
 }

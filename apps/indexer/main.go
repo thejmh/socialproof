@@ -37,7 +37,7 @@ func main() {
 	defer client.Close()
 
 	// 3. 엔진 초기화 및 실행
-	indexer := engine.NewIndexerEngine(client, logger, 5)
+	indexer := engine.NewIndexerEngine(client, logger, cfg.WorkerCount, cfg.StartBlock)
 
 	go indexer.Start(ctx)
 
