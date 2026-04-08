@@ -17,17 +17,31 @@ import (
 
 func main() {
 	// 0. .env 파일 로드 (가장 먼저 실행!)
-	err := godotenv.Load()
-	// 이 함수가 # 주석을 다 걸러내고 환경 변수로 등록해줍니다.
-	if err != nil {
-		log.Println(".env 파일을 찾을 수 없습니다. 시스템 환경 변수를 사용합니다.")
+	if err := godotenv.Load(); err != nil {
+		log.Println("알림: .env 파일을 찾을 수 없습니다. OS 환경 변수를 직접 참조합니다.(하이브리드 설정 로드)")
 	}
 
 	// 1. 설정 및 로거 초기화
 	cfg := config.New()
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	if cfg.EthRPCURL == "" {
+		log.Fatal("치명적 에러: ETH_RPC_URL이 설정되지 않았습니다.")
+	}
+	var logLevel = slog.LevelInfo // 기본값
+
+	// .env나 config에서 LOG_LEVEL=debug 라고 설정했다면
+	if cfg.LogLevel == "debug" {
+		logLevel = slog.LevelDebug
+	}
+
+	// HandlerOptions를 통해 최소 로그 레벨을 지정합니다.
+	opts := &slog.HandlerOptions{
+		Level: logLevel,
+	}
+
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, opts))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
 	// 2. EVM 클라이언트 생성
 	client, err := ethereum.NewClient(ctx, cfg.EthRPCURL, cfg.EthWSURL, logger)
 	if err != nil {
@@ -36,8 +50,8 @@ func main() {
 	}
 	defer client.Close()
 
-	// 3. 엔진 초기화 및 실행
-	indexer := engine.NewIndexerEngine(client, logger, cfg.WorkerCount, cfg.StartBlock)
+	// 3. 엔진 초기화 , DB 연결을 포함하여 인덱서 엔진을 생성합니다.
+	indexer := engine.NewIndexerEngine(client, cfg.DatabaseURL, logger, cfg)
 
 	go indexer.Start(ctx)
 

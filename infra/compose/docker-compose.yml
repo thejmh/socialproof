@@ -1,0 +1,55 @@
+version: '3.8' # Docker Compose 파일 형식 버전
+
+services:
+  # 1. 데이터의 안식처: PostgreSQL
+  postgres:
+    image: postgres:15-alpine # 가볍고 보안이 강화된 Alpine 기반 Postgres 15 이미지 사용
+    container_name: sp-db # 컨테이너의 고유 이름 (도커 내부 별명)
+    restart: always # 에러로 죽거나 서버 재부팅 시 자동으로 다시 살림
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres} # .env에서 읽어온 DB 사용자 아이디 주입
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-password} # .env에서 읽어온 비밀번호 주입
+      POSTGRES_DB: ${DB_NAME:-socialproof} # 초기 생성될 데이터베이스 이름
+    ports:
+      - "5432:5432" # 호스트PC의 5432 포트와 컨테이너의 5432 포트 연결
+    volumes:
+      - sp_postgres_data:/var/lib/postgresql/data # [중요] 데이터를 영구 저장할 볼륨 연결
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql # 컨테이너 시작 시 초기화 SQL 스크립트 자동 실행
+    networks:
+      - sp-network # 동일한 네트워크에 속한 컨테이너끼리만 통신 가능
+
+  # 2. 비동기 작업의 쉼터: Redis
+  redis:
+    image: redis:alpine # 초경량 Redis 이미지
+    container_name: sp-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - sp-network
+
+  # 3. 시스템의 두뇌: 온체인 인덱서
+  indexer:
+    build:
+      context: ../../ # Dockerfile을 찾을 경로 (상위 폴더 기준)
+      dockerfile: apps/indexer/Dockerfile # 사용할 Dockerfile 명칭
+    container_name: sp-indexer # 'SocialProof Indexer'의 약칭
+    depends_on:
+      # 실행 순서 제어 (DB와 Redis가 먼저 떠야 함)
+      - postgres
+      - redis
+    environment:
+      # 코드 내부에서 사용할 DB 접속 주소 (서비스 이름인 'postgres'를 호스트명으로 사용)
+      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}?sslmode=disable
+      - REDIS_ADDR=redis:6379
+    networks:
+      - sp-network
+
+# 공용 네트워크 정의 (컨테이너 간 사설망)
+networks:
+  sp-network:
+    driver: bridge
+
+# 영구 저장소 정의 (컨테이너가 지워져도 이 볼륨은 남음)
+volumes:
+  sp_postgres_data:
+    driver: local
