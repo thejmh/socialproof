@@ -16,47 +16,72 @@ import (
 )
 
 func main() {
-	// 0. .env 파일 로드 (가장 먼저 실행!)
-	err := godotenv.Load()
-	// 이 함수가 # 주석을 다 걸러내고 환경 변수로 등록해줍니다.
-	if err != nil {
-		log.Println(".env 파일을 찾을 수 없습니다. 시스템 환경 변수를 사용합니다.")
+	// 0. .env 파일 로드
+	if err := godotenv.Load(); err != nil {
+		log.Println("알림: .env 파일을 찾을 수 없습니다. OS 환경 변수를 직접 참조합니다.")
 	}
 
 	// 1. 설정 및 로거 초기화
 	cfg := config.New()
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	if cfg.EthRPCURL == "" {
+		log.Fatal("치명적 에러: ETH_RPC_URL이 설정되지 않았습니다.")
+	}
+
+	var logLevel = slog.LevelInfo
+	if cfg.LogLevel == "debug" {
+		logLevel = slog.LevelDebug
+	}
+
+	opts := &slog.HandlerOptions{Level: logLevel}
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, opts))
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	// 2. EVM 클라이언트 생성
+
+	// ---------------------------------------------------------
+	// [추가/수정] 2. PostgreSQL 연결 (엔진에 넘겨주기 전 미리 연결)
+	// ---------------------------------------------------------
+	// NewIndexer는 내부적으로 5번 재시도하며 연결을 시도합니다.
+	dbInstance, err := engine.NewIndexer(cfg.DatabaseURL)
+	if err != nil {
+		logger.Error("데이터베이스 초기화 실패", "error", err)
+		os.Exit(1)
+	}
+	// Indexer 구조체 내부의 실제 *sql.DB 추출 (GetDB 메서드가 있다고 가정)
+	// 만약 메서드가 없다면 dbInstance.DB 등으로 직접 접근 가능하게 필드를 확인하세요.
+	sqlDB := dbInstance.GetDB()
+	defer sqlDB.Close() // 프로그램 종료 시 안전하게 DB 연결 해제
+	// ---------------------------------------------------------
+
+	// 3. EVM 클라이언트 생성
 	client, err := ethereum.NewClient(ctx, cfg.EthRPCURL, cfg.EthWSURL, logger)
 	if err != nil {
-		logger.Error("시스템 초기화 실패", "error", err)
+		logger.Error("EVM 클라이언트 초기화 실패", "error", err)
 		os.Exit(1)
 	}
 	defer client.Close()
 
-	// 3. 엔진 초기화 및 실행
-	indexer := engine.NewIndexerEngine(client, logger, cfg.WorkerCount, cfg.StartBlock)
+	// 2. 이제 객체를 인자로 전달 (타입 일치!)
+	indexer := engine.NewIndexerEngine(client, sqlDB, logger, cfg)
 
+	// 5. 엔진 실행
 	go indexer.Start(ctx)
 
-	// 4. [추가] OS 신호를 기다리는 채널 생성
+	// 6. OS 신호 감시
 	sigChan := make(chan os.Signal, 1)
-	// 인터럽트(Ctrl+C)와 터미네이트(Kill) 신호를 감시합니다.
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	logger.Info("시스템 가동 중... 정지하려면 Ctrl+C를 누르세요.")
+	logger.Info("SocialProof 인덱서 시스템 가동 중...",
+		"rpc", cfg.EthRPCURL,
+		"db", "connected",
+		"log_level", logLevel.String(),
+	)
 
-	// 5. [핵심] 여기서 신호가 올 때까지 코드 실행이 "차단(Block)"됩니다.
 	sig := <-sigChan
-
 	logger.Info("셧다운 신호 수신", "signal", sig.String())
 
-	// 6. 정리 작업 (Context 취소로 고루틴들에게 종료 알림)
-	cancel()
+	cancel() // 고루틴 종료 알림
 
-	// 잠시 대기하여 고루틴들이 정리할 시간을 줍니다.
 	time.Sleep(1 * time.Second)
 	logger.Info("인덱서가 안전하게 종료되었습니다.")
 }

@@ -2,34 +2,120 @@ package engine
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
 	"log/slog"
 	"math/big"
 	"time"
 
-	//TODO :필터가동 시 해제
-	// eth "github.com/ethereum/go-ethereum"
-	// "github.com/ethereum/go-ethereum/common"
+	eth "github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/thejmh/socialproof/apps/indexer/internal/config"
 	"github.com/thejmh/socialproof/apps/indexer/pkg/ethereum"
+
+	// Postgres 드라이버
+	_ "github.com/lib/pq"
 )
 
+// EventRecord는 DB에 저장할 데이터 구조체입니다.
+type EventRecord struct {
+	BlockNumber     int64
+	TxHash          string
+	EventType       string
+	ContractAddress string
+	CallerAddress   string
+	RawData         map[string]interface{}
+}
+
+// NewIndexer는 DB 연결을 초기화하는 생성자입니다.
 type IndexerEngine struct {
-	client ethereum.Client
-	logger *slog.Logger
-	// taskQueue는 asyncio.Queue와 같은 역할을 하는 Go 채널입니다.
+	client      ethereum.Client
+	logger      *slog.Logger
+	db          *sql.DB // 핵심: 이 객체가 nil이면 안 됩니다.
 	taskQueue   chan BlockTask
 	workerCount int
 	startBlock  int64
 }
 
-func NewIndexerEngine(client ethereum.Client, logger *slog.Logger, workerCount int, startBlock int64) *IndexerEngine {
+func NewIndexerEngine(client ethereum.Client, db *sql.DB, logger *slog.Logger, cfg *config.Config) *IndexerEngine {
 	return &IndexerEngine{
 		client:      client,
+		db:          db, // 주입받은 객체를 그대로 할당
 		logger:      logger,
-		taskQueue:   make(chan BlockTask, config.New().TaskQueueSize), // 대량 백필을 위해 큐 크기 확장
-		workerCount: workerCount,
-		startBlock:  startBlock,
+		taskQueue:   make(chan BlockTask, cfg.BackfillQueueSize),
+		workerCount: cfg.WorkerCount,
+		startBlock:  cfg.StartBlock,
 	}
+}
+
+// DB 연결을 초기화하는 함수입니다. 연결이 실패할 경우 nil을 반환합니다.
+func NewDB(connStr string, logger *slog.Logger) *sql.DB {
+	// DB 연결 시도 (재시도 로직 포함)
+	var db *sql.DB
+	var err error
+
+	for i := 0; i < 5; i++ { // 최대 5번 재시도
+		db, err = sql.Open("postgres", connStr)
+		if err == nil {
+			err = db.Ping() // 실제 연결 확인
+			if err == nil {
+				logger.Info("✅ PostgreSQL 연결 성공")
+				return db
+			}
+		}
+		//e.logger.Error("⚠️ DB 연결 실패 (재시도 %d/5): %v", i+1, err)
+		time.Sleep(2 * time.Second)
+	}
+	return nil
+}
+
+// NewIndexer는 main.go에서 호출하며, 연결된 Indexer 객체를 반환합니다.
+func NewIndexer(connStr string) (*Indexer, error) {
+	var db *sql.DB
+	var err error
+
+	for i := 0; i < 5; i++ {
+		db, err = sql.Open("postgres", connStr)
+		if err == nil {
+			err = db.Ping()
+			if err == nil {
+				return &Indexer{db: db}, nil
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return nil, fmt.Errorf("PostgreSQL 연결 최종 실패: %v", err)
+}
+
+// SaveEvent는 온체인 이벤트를 onchain_events 테이블에 기록합니다.
+func (e *IndexerEngine) SaveEvent(event EventRecord) error {
+	// [안전장치] nil 포인터 패닉 방지
+	if e.db == nil {
+		return fmt.Errorf("데이터베이스 연결 객체가 초기화되지 않았습니다(nil)")
+	}
+
+	query := `
+        INSERT INTO onchain_events (
+            block_number, tx_hash, event_type, contract_address, caller_address, raw_data
+        ) VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (tx_hash) DO NOTHING;
+    `
+
+	jsonData, err := json.Marshal(event.RawData)
+	if err != nil {
+		return err
+	}
+
+	_, err = e.db.Exec(query,
+		event.BlockNumber,
+		event.TxHash,
+		event.EventType,
+		event.ContractAddress,
+		event.CallerAddress,
+		jsonData,
+	)
+	return err
 }
 
 // Start는 생산자와 소비자를 모두 가동합니다.
@@ -45,7 +131,16 @@ func (e *IndexerEngine) Start(ctx context.Context) {
 	go e.realtimeWatcher(ctx)
 
 	// 3. 과거 데이터 백필(Historical Backfill) 시작
-	go e.historicalBackfill(ctx)
+	//go e.historicalBackfill(ctx)
+}
+
+// Indexer 구조체는 DB 연결 관리를 위해 별도로 유지할 수 있습니다.
+type Indexer struct {
+	db *sql.DB
+}
+
+func (i *Indexer) GetDB() *sql.DB {
+	return i.db
 }
 
 // historicalBackfill은 시작 지점부터 현재 블록까지 빠르게 채웁니다.
@@ -123,6 +218,8 @@ func (e *IndexerEngine) realtimeWatcher(ctx context.Context) {
 		}
 	}
 }
+
+// worker는 큐에서 블록 번호를 받아 처리하는 소비자입니다.
 func (e *IndexerEngine) worker(ctx context.Context, id int) {
 	e.logger.Info("Worker 가동", "id", id)
 	for {
@@ -130,38 +227,51 @@ func (e *IndexerEngine) worker(ctx context.Context, id int) {
 		case <-ctx.Done():
 			return
 		case task := <-e.taskQueue:
-
 			// 1. 블록 전체를 가져오는 대신 로그만 필터링 (가벼움!)
+			query := eth.FilterQuery{
+				FromBlock: task.BlockNumber,
+				ToBlock:   task.BlockNumber,
+				// Addresses: []common.Address{common.HexToAddress("0x...")},
+			}
 
-			//TODO : 실제로 관심 있는 이벤트가 있다면, 여기서 필터링 조건을 넣어야 합니다.
-			// query := eth.FilterQuery{
-			// 	FromBlock: task.BlockNumber,
-			// 	ToBlock:   task.BlockNumber,
-			// 	Addresses: []common.Address{common.HexToAddress("0x...")},
-			// }
+			logs, err := e.client.GetHTTP().FilterLogs(ctx, query)
+			if err != nil {
+				e.logger.Error("Worker: 로그 필터링 실패", "block", task.BlockNumber, "error", err)
+				continue
+			}
 
-			// logs, err := e.client.GetHTTP().FilterLogs(ctx, query)
+			// 1-1 관심 있는 이벤트가 없더라도 블록 전체를 처리해야 하는 경우
+			// block, err := e.client.GetHTTP().BlockByNumber(ctx, task.BlockNumber)
 			// if err != nil {
-			// 	e.logger.Error("Worker: 로그 필터링 실패", "block", task.BlockNumber, "error", err)
+			// 	e.logger.Error("소비자: 블록 상세 조회 실패", "block", task.BlockNumber, "error", err)
+			// 	// 실패 시 재시도 로직 등을 추가할 수 있음
 			// 	continue
 			// }
 
-			// 1-1 관심 있는 이벤트가 없더라도 블록 전체를 처리해야 하는 경우
-			block, err := e.client.GetHTTP().BlockByNumber(ctx, task.BlockNumber)
-			if err != nil {
-				e.logger.Error("소비자: 블록 상세 조회 실패", "block", task.BlockNumber, "error", err)
-				// 실패 시 재시도 로직 등을 추가할 수 있음
-				continue
+			for _, vLog := range logs {
+				event := EventRecord{
+					BlockNumber:     int64(vLog.BlockNumber),
+					TxHash:          vLog.TxHash.Hex(),
+					EventType:       "ONCHAIN_EVENT", // TODO: ABI 파싱 후 실제 Event Name 주입
+					ContractAddress: vLog.Address.Hex(),
+					// CallerAddress는 로그만으로는 알 수 없으므로 필요 시 Transaction 객체 조회 필요
+					CallerAddress: "",
+					RawData: map[string]interface{}{
+						"address": vLog.Address.Hex(),
+						"topics":  vLog.Topics,
+						"data":    common.Bytes2Hex(vLog.Data),
+						"index":   vLog.Index,
+					},
+				}
+
+				if err := e.SaveEvent(event); err != nil {
+					e.logger.Error("Worker: DB 저장 실패", "tx", event.TxHash, "error", err)
+				} else {
+					e.logger.Debug("Worker: 이벤트 저장 성공", "tx", event.TxHash)
+				}
 			}
-			//TODO : DB 저장은 여기서 수행해야 합니다. 로그가 없더라도 블록 자체의 정보가 중요할 수 있기 때문입니다.
 
-			e.logger.Info("소비자: 처리 완료", "block", block.Number().String(), "tx_count", len(block.Transactions()))
-
-			// 2. 관련 로그가 있을 때만 처리
-			// for _, vLog := range logs {
-			// 	e.logger.Info("중요 이벤트 발견!", "tx", vLog.TxHash.Hex(), "block", vLog.BlockNumber)
-			// 	// 여기서만 DB 저장 수행!
-			// }
+			//e.logger.Info("소비자: 처리 완료", "block", block.Number().String(), "tx_count", len(block.Transactions()))
 		}
 	}
 }
