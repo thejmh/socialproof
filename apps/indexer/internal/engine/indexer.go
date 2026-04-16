@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"math/big"
 	"time"
@@ -29,19 +30,18 @@ type EventRecord struct {
 
 // NewIndexer는 DB 연결을 초기화하는 생성자입니다.
 type IndexerEngine struct {
-	client ethereum.Client
-	logger *slog.Logger
-	db     *sql.DB // DB 연결 객체 추가
-	// taskQueue는 asyncio.Queue와 같은 역할을 하는 Go 채널입니다.
+	client      ethereum.Client
+	logger      *slog.Logger
+	db          *sql.DB // 핵심: 이 객체가 nil이면 안 됩니다.
 	taskQueue   chan BlockTask
 	workerCount int
 	startBlock  int64
 }
 
-func NewIndexerEngine(client ethereum.Client, connStr string, logger *slog.Logger, cfg *config.Config) *IndexerEngine {
+func NewIndexerEngine(client ethereum.Client, db *sql.DB, logger *slog.Logger, cfg *config.Config) *IndexerEngine {
 	return &IndexerEngine{
 		client:      client,
-		db:          NewDB(connStr, logger), // DB 연결 초기화
+		db:          db, // 주입받은 객체를 그대로 할당
 		logger:      logger,
 		taskQueue:   make(chan BlockTask, cfg.BackfillQueueSize),
 		workerCount: cfg.WorkerCount,
@@ -70,13 +70,36 @@ func NewDB(connStr string, logger *slog.Logger) *sql.DB {
 	return nil
 }
 
+// NewIndexer는 main.go에서 호출하며, 연결된 Indexer 객체를 반환합니다.
+func NewIndexer(connStr string) (*Indexer, error) {
+	var db *sql.DB
+	var err error
+
+	for i := 0; i < 5; i++ {
+		db, err = sql.Open("postgres", connStr)
+		if err == nil {
+			err = db.Ping()
+			if err == nil {
+				return &Indexer{db: db}, nil
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return nil, fmt.Errorf("PostgreSQL 연결 최종 실패: %v", err)
+}
+
 // SaveEvent는 온체인 이벤트를 onchain_events 테이블에 기록합니다.
 func (e *IndexerEngine) SaveEvent(event EventRecord) error {
+	// [안전장치] nil 포인터 패닉 방지
+	if e.db == nil {
+		return fmt.Errorf("데이터베이스 연결 객체가 초기화되지 않았습니다(nil)")
+	}
+
 	query := `
         INSERT INTO onchain_events (
             block_number, tx_hash, event_type, contract_address, caller_address, raw_data
         ) VALUES ($1, $2, $3, $4, $5, $6)
-        ON CONFLICT (tx_hash) DO NOTHING; -- 중복 저장 방지 (트랜잭션 해시 유니크 제약 시)
+        ON CONFLICT (tx_hash) DO NOTHING;
     `
 
 	jsonData, err := json.Marshal(event.RawData)
@@ -109,6 +132,15 @@ func (e *IndexerEngine) Start(ctx context.Context) {
 
 	// 3. 과거 데이터 백필(Historical Backfill) 시작
 	//go e.historicalBackfill(ctx)
+}
+
+// Indexer 구조체는 DB 연결 관리를 위해 별도로 유지할 수 있습니다.
+type Indexer struct {
+	db *sql.DB
+}
+
+func (i *Indexer) GetDB() *sql.DB {
+	return i.db
 }
 
 // historicalBackfill은 시작 지점부터 현재 블록까지 빠르게 채웁니다.
