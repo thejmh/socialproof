@@ -12,6 +12,7 @@ type Config struct {
 	EthWSURL          string        `env:"ETH_WS_URL,required"`
 	ChainID           int64         `env:"CHAIN_ID" envDefault:"1"`
 	RedisAddr         string        `env:"REDIS_ADDR" envDefault:"localhost:6379"`
+	RedisPassword     string        `env:"REDIS_PASSWORD" envDefault:""` // 추가: Redis 비밀번호
 	LogLevel          string        `env:"LOG_LEVEL" envDefault:"debug"`
 	StartBlock        int64         `env:"IDX_START_BLOCK" envDefault:"0"` // 인덱싱 시작점
 	WorkerCount       int           `env:"IDX_WORKER_COUNT" envDefault:"2"`
