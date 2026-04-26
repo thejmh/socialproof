@@ -57,20 +57,32 @@ func NewIndexerEngine(client ethereum.Client, db *sql.DB, stateMgr *storage.Stat
 	return e
 }
 
-// NewDB 및 NewIndexer 함수는 이전과 동일하여 생략 (그대로 유지)
-func NewDB(connStr string, logger *slog.Logger) *sql.DB {
+// [변경] NewDB 팩토리 함수에 Config 객체 주입을 통한 Connection Pool 동적 튜닝
+func NewDB(connStr string, logger *slog.Logger, cfg *config.Config) *sql.DB {
 	var db *sql.DB
 	var err error
+
 	for i := 0; i < 5; i++ {
 		db, err = sql.Open("postgres", connStr)
 		if err == nil && db.Ping() == nil {
-			logger.Info("✅ PostgreSQL 연결 성공")
+			// 시스템 병목 해소 공식(SBR) 반영: 커넥션 풀 명시적 세팅
+			db.SetMaxOpenConns(cfg.DBMaxOpenConns)
+			db.SetMaxIdleConns(cfg.DBMaxIdleConns)
+			db.SetConnMaxLifetime(cfg.DBConnMaxLifetime)
+
+			logger.Info("✅ PostgreSQL 연결 및 Connection Pool 최적화 성공",
+				"MaxOpen", cfg.DBMaxOpenConns,
+				"MaxIdle", cfg.DBMaxIdleConns)
 			return db
 		}
+		logger.Warn("PostgreSQL 연결 재시도 중...", "attempt", i+1, "error", err)
 		time.Sleep(2 * time.Second)
 	}
+
+	logger.Error("PostgreSQL 연결 최종 실패", "error", err)
 	return nil
 }
+
 func NewIndexer(connStr string) (*Indexer, error) {
 	var db *sql.DB
 	var err error
@@ -128,10 +140,19 @@ func (e *IndexerEngine) Start(ctx context.Context) {
 			e.startBlock = lastSavedBlock
 		}
 	}
-	e.logger.Info("이중 동기화 엔진 가동", "workers", e.workerCount, "actual_start_from", e.startBlock)
+	e.logger.Info("🚀 이중 동기화 엔진 가동 시작",
+		"workers", e.workerCount,
+		"start_from", e.startBlock)
+
+	// 2. 소비자(Worker) 가동: 설정된 워커 개수만큼 병렬 실행
 	for i := 0; i < e.workerCount; i++ {
 		go e.worker(ctx, i)
 	}
+
+	// 3. 백필 생산자 가동
+	go e.historicalBackfill(ctx)
+
+	// 4. 실시간 생산자 가동
 	go e.realtimeWatcher(ctx)
 }
 
@@ -148,21 +169,35 @@ func (e *IndexerEngine) historicalBackfill(ctx context.Context) {
 	e.currentLatest.Store(targetBlock) // 워커들을 위해 원자적 최신값 갱신
 
 	cfg := config.New()
-	e.logger.Info("백필 대상 블록 범위", "from", e.startBlock, "to", targetBlock)
+	batchSize := cfg.IdxBatchSize
+	if batchSize == 0 {
+		batchSize = 2000 // 기본 안전 마진 (예: RPC 노드 최대 허용 범위)
+	}
 
-	for i := e.startBlock; i <= targetBlock; i++ {
+	e.logger.Info("백필 대상 블록 범위", "from", e.startBlock, "to", targetBlock, "batch_size", batchSize)
+
+	// [핵심 변경] 블록 1개씩 큐에 넣는 대신, batchSize 단위로 묶어서(Chunk) 큐에 투입
+	for from := e.startBlock; from <= targetBlock; from += batchSize {
 		select {
 		case <-ctx.Done():
 			return
 		default:
-			e.taskQueue <- BlockTask{BlockNumber: big.NewInt(i)}
+			to := from + batchSize - 1
+			if to > targetBlock {
+				to = targetBlock
+			}
 
-			if i > e.startBlock && i%cfg.IdxBatchSize == 0 {
-				if len(e.taskQueue) > cfg.BackfillQueueSize {
-					time.Sleep(cfg.SleepDuration * 2)
-				} else {
-					time.Sleep(cfg.SleepDuration)
-				}
+			// 구간 단위(From~To)로 워커에게 작업 하달
+			e.taskQueue <- BlockTask{
+				FromBlock: big.NewInt(from),
+				ToBlock:   big.NewInt(to),
+			}
+
+			// 큐에 작업이 많이 쌓여있으면 백프레셔(대기) 작동 - 원본 로직 유지
+			if len(e.taskQueue) > cfg.BackfillQueueSize {
+				time.Sleep(cfg.SleepDuration * 2)
+			} else {
+				time.Sleep(cfg.SleepDuration)
 			}
 		}
 	}
@@ -192,10 +227,10 @@ func (e *IndexerEngine) realtimeWatcher(ctx context.Context) {
 			if lastBlock == nil || header.Number.Cmp(lastBlock) > 0 {
 				if lastBlock != nil {
 					for i := new(big.Int).Add(lastBlock, big.NewInt(1)); i.Cmp(header.Number) <= 0; i.Add(i, big.NewInt(1)) {
-						e.taskQueue <- BlockTask{BlockNumber: new(big.Int).Set(i)}
+						e.taskQueue <- BlockTask{FromBlock: new(big.Int).Set(i), ToBlock: new(big.Int).Set(i)}
 					}
 				} else {
-					e.taskQueue <- BlockTask{BlockNumber: header.Number}
+					e.taskQueue <- BlockTask{FromBlock: header.Number, ToBlock: header.Number}
 				}
 				lastBlock = header.Number
 				e.logger.Debug("실시간 블록 감지", "number", lastBlock.String())
@@ -213,8 +248,8 @@ func (e *IndexerEngine) worker(ctx context.Context, id int) {
 			return
 		case task := <-e.taskQueue:
 			query := eth.FilterQuery{
-				FromBlock: task.BlockNumber,
-				ToBlock:   task.BlockNumber, Addresses: []common.Address{
+				FromBlock: task.FromBlock,
+				ToBlock:   task.ToBlock, Addresses: []common.Address{
 					// Sepolia EAS 공식 컨트랙트 주소 (메인넷의 경우 메인넷 EAS 주소로 변경)
 					common.HexToAddress("0xC2679fBD37d54388Ce493F1DB75320D236e1815e"),
 				},
@@ -223,7 +258,7 @@ func (e *IndexerEngine) worker(ctx context.Context, id int) {
 			// 주의: 클라이언트는 타입 호환성 문제가 없도록 go-ethereum의 패키지 사용
 			logs, err := e.client.GetHTTP().FilterLogs(ctx, query)
 			if err != nil {
-				e.logger.Error("Worker: 로그 필터링 실패", "block", task.BlockNumber, "error", err)
+				e.logger.Error("Worker: 로그 필터링 실패", "from_block", task.FromBlock, "to_block", task.ToBlock, "error", err)
 				continue
 			}
 
@@ -265,8 +300,8 @@ func (e *IndexerEngine) worker(ctx context.Context, id int) {
 
 			if e.stateMgr != nil {
 				latest := e.currentLatest.Load()
-				if err := e.stateMgr.UpdateProgress(ctx, task.BlockNumber.Int64(), latest); err != nil {
-					e.logger.Error("Worker: Redis 상태 업데이트 실패", "block", task.BlockNumber, "error", err)
+				if err := e.stateMgr.UpdateProgress(ctx, task.FromBlock.Int64(), latest); err != nil {
+					e.logger.Error("Worker: Redis 상태 업데이트 실패", "from_block", task.FromBlock, "to_block", task.ToBlock, "error", err)
 				}
 			}
 		}
