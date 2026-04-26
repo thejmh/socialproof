@@ -12,15 +12,20 @@ type Config struct {
 	EthWSURL          string        `env:"ETH_WS_URL,required"`
 	ChainID           int64         `env:"CHAIN_ID" envDefault:"1"`
 	RedisAddr         string        `env:"REDIS_ADDR" envDefault:"localhost:6379"`
-	RedisPassword     string        `env:"REDIS_PASSWORD" envDefault:""` // 추가: Redis 비밀번호
+	RedisPassword     string        `env:"REDIS_PASSWORD" envDefault:""`
 	LogLevel          string        `env:"LOG_LEVEL" envDefault:"debug"`
-	StartBlock        int64         `env:"IDX_START_BLOCK" envDefault:"0"` // 인덱싱 시작점
-	WorkerCount       int           `env:"IDX_WORKER_COUNT" envDefault:"2"`
-	IdxBatchSize      int64         `env:"IDX_BATCH_SIZE" envDefault:"5"`           // 한 번에 처리할 블록 수
-	SleepDuration     time.Duration `env:"IDX_SLEEP_DURATION" envDefault:"500ms"`   // 백필 시 대기 시간 (ms)
-	BackfillQueueSize int           `env:"IDX_BACKFILL_QUEUE_SIZE" envDefault:"10"` // 인덱싱 작업 큐 크기
-	TaskQueueSize     int           `env:"IDX_TASK_QUEUE_SIZE" envDefault:"100"`    // 실제 작업을 담는 큐 크기
-	DatabaseURL       string        `env:"DATABASE_URL,required"`                   // PostgreSQL 연결 문자열
+	StartBlock        int64         `env:"IDX_START_BLOCK" envDefault:"0"`
+	WorkerCount       int           `env:"IDX_WORKER_COUNT" envDefault:"10"` // 튜닝됨
+	IdxBatchSize      int64         `env:"IDX_BATCH_SIZE" envDefault:"5"`
+	SleepDuration     time.Duration `env:"IDX_SLEEP_DURATION" envDefault:"500ms"`
+	BackfillQueueSize int           `env:"IDX_BACKFILL_QUEUE_SIZE" envDefault:"100"`
+	TaskQueueSize     int           `env:"IDX_TASK_QUEUE_SIZE" envDefault:"500"`
+	DatabaseURL       string        `env:"DATABASE_URL,required"`
+
+	// [추가] DB 커넥션 풀 최적화
+	DBMaxOpenConns    int           `env:"DB_MAX_OPEN_CONNS" envDefault:"50"`
+	DBMaxIdleConns    int           `env:"DB_MAX_IDLE_CONNS" envDefault:"20"`
+	DBConnMaxLifetime time.Duration `env:"DB_CONN_MAX_LIFETIME" envDefault:"5m"`
 }
 
 func New() *Config {

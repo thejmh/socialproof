@@ -36,3 +36,5 @@ go.sum
 *.jks
 *.p12
 *.keystore
+001_socialproof_docs_portable/
+.tmp.*
