@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/hibiken/asynq" // Asynq 추가
 	"github.com/joho/godotenv"
 	"github.com/thejmh/socialproof/apps/indexer/internal/config"
 	"github.com/thejmh/socialproof/apps/indexer/internal/engine"
@@ -17,7 +18,6 @@ import (
 	"github.com/thejmh/socialproof/apps/indexer/pkg/ethereum"
 )
 
-// [테스트용 대리망] EAS (Ethereum Attestation Service)의 Attested 이벤트 ABI
 const easAttestedABI = `[{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"recipient","type":"address"},{"indexed":true,"internalType":"address","name":"attester","type":"address"},{"indexed":false,"internalType":"bytes32","name":"uid","type":"bytes32"},{"indexed":true,"internalType":"bytes32","name":"schema","type":"bytes32"}],"name":"Attested","type":"event"}]`
 
 func main() {
@@ -41,7 +41,6 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 1. PostgreSQL 연결 초기화
 	dbInstance, err := engine.NewIndexer(cfg.DatabaseURL)
 	if err != nil {
 		logger.Error("데이터베이스 초기화 실패", "error", err)
@@ -50,7 +49,6 @@ func main() {
 	sqlDB := dbInstance.GetDB()
 	defer sqlDB.Close()
 
-	// 2. Redis StateManager 초기화
 	stateMgr, err := storage.NewStateManager(cfg.RedisAddr, cfg.RedisPassword, cfg.ChainID, cfg.StartBlock, logger)
 	if err != nil {
 		logger.Error("Redis 초기화 실패", "error", err)
@@ -58,7 +56,6 @@ func main() {
 	}
 	defer stateMgr.Close()
 
-	// 3. EVM 클라이언트 생성
 	client, err := ethereum.NewClient(ctx, cfg.EthRPCURL, cfg.EthWSURL, logger)
 	if err != nil {
 		logger.Error("EVM 클라이언트 초기화 실패", "error", err)
@@ -66,7 +63,6 @@ func main() {
 	}
 	defer client.Close()
 
-	// 4. [혁신 적용] 유니버설 디코더 초기화 (EAS ABI 주입)
 	univDecoder, err := decoder.NewUniversalDecoder(easAttestedABI)
 	if err != nil {
 		logger.Error("디코더 초기화 실패", "error", err)
@@ -74,10 +70,28 @@ func main() {
 	}
 	logger.Info("✅ 범용 동적 디코더 엔진 초기화 성공")
 
-	// 5. 의존성 주입을 통한 인덱서 엔진 생성 (디코더 포함)
-	indexer := engine.NewIndexerEngine(client, sqlDB, stateMgr, univDecoder, logger, cfg)
+	// [신규] Asynq 클라이언트 및 서버 초기화
+	asynqOpt := asynq.RedisClientOpt{Addr: cfg.RedisAddr, Password: cfg.RedisPassword}
+	asynqClient := asynq.NewClient(asynqOpt)
+	defer asynqClient.Close()
 
-	// 6. 엔진 실행
+	// 파라미터에 asynqClient 추가 주입
+	indexer := engine.NewIndexerEngine(client, sqlDB, stateMgr, univDecoder, asynqClient, logger, cfg)
+
+	// [신규] Asynq 백그라운드 서버 가동 (소비자 역할)
+	asynqSrv := asynq.NewServer(asynqOpt, asynq.Config{
+		Concurrency: cfg.WorkerCount, // 큐 처리 워커 수 설정
+	})
+	mux := asynq.NewServeMux()
+	mux.HandleFunc("event:process", indexer.HandleEventProcessTask) // 큐 라우팅
+
+	go func() {
+		if err := asynqSrv.Run(mux); err != nil {
+			logger.Error("❌ Asynq 서버 실행 실패", "error", err)
+		}
+	}()
+	defer asynqSrv.Stop()
+
 	go indexer.Start(ctx)
 
 	sigChan := make(chan os.Signal, 1)
@@ -86,7 +100,7 @@ func main() {
 	logger.Info("SocialProof 인덱서 시스템 가동 중...",
 		"rpc", cfg.EthRPCURL,
 		"db", "connected",
-		"redis", "connected",
+		"redis_asynq", "connected",
 		"log_level", logLevel.String(),
 	)
 

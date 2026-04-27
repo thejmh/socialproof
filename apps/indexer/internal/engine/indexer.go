@@ -12,17 +12,23 @@ import (
 
 	eth "github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/hibiken/asynq" // Asynq 추가
 	"github.com/thejmh/socialproof/apps/indexer/internal/config"
 	"github.com/thejmh/socialproof/apps/indexer/internal/storage"
-	"github.com/thejmh/socialproof/apps/indexer/pkg/decoder" // 디코더 임포트
+	"github.com/thejmh/socialproof/apps/indexer/pkg/decoder"
 	"github.com/thejmh/socialproof/apps/indexer/pkg/ethereum"
 
 	_ "github.com/lib/pq"
 )
 
+const (
+	SafeConfirmations = int64(30)
+)
+
 type EventRecord struct {
 	BlockNumber     int64
 	TxHash          string
+	LogIndex        int // [추가] 멱등성 보장을 위한 필수 식별자
 	EventType       string
 	ContractAddress string
 	CallerAddress   string
@@ -34,20 +40,22 @@ type IndexerEngine struct {
 	logger        *slog.Logger
 	db            *sql.DB
 	stateMgr      *storage.StateManager
-	decoder       *decoder.UniversalDecoder // [추가] 디코더 의존성
+	decoder       *decoder.UniversalDecoder
+	asynqClient   *asynq.Client // [추가] 큐 적재기
 	taskQueue     chan BlockTask
 	workerCount   int
 	startBlock    int64
 	currentLatest atomic.Int64
 }
 
-// [변경] 생성자에 UniversalDecoder 파라미터 추가
-func NewIndexerEngine(client ethereum.Client, db *sql.DB, stateMgr *storage.StateManager, univDecoder *decoder.UniversalDecoder, logger *slog.Logger, cfg *config.Config) *IndexerEngine {
+// [변경] asynqClient 의존성 주입
+func NewIndexerEngine(client ethereum.Client, db *sql.DB, stateMgr *storage.StateManager, univDecoder *decoder.UniversalDecoder, asynqClient *asynq.Client, logger *slog.Logger, cfg *config.Config) *IndexerEngine {
 	e := &IndexerEngine{
 		client:      client,
 		db:          db,
 		stateMgr:    stateMgr,
 		decoder:     univDecoder,
+		asynqClient: asynqClient,
 		logger:      logger,
 		taskQueue:   make(chan BlockTask, cfg.BackfillQueueSize),
 		workerCount: cfg.WorkerCount,
@@ -57,7 +65,6 @@ func NewIndexerEngine(client ethereum.Client, db *sql.DB, stateMgr *storage.Stat
 	return e
 }
 
-// [변경] NewDB 팩토리 함수에 Config 객체 주입을 통한 Connection Pool 동적 튜닝
 func NewDB(connStr string, logger *slog.Logger, cfg *config.Config) *sql.DB {
 	var db *sql.DB
 	var err error
@@ -65,21 +72,13 @@ func NewDB(connStr string, logger *slog.Logger, cfg *config.Config) *sql.DB {
 	for i := 0; i < 5; i++ {
 		db, err = sql.Open("postgres", connStr)
 		if err == nil && db.Ping() == nil {
-			// 시스템 병목 해소 공식(SBR) 반영: 커넥션 풀 명시적 세팅
 			db.SetMaxOpenConns(cfg.DBMaxOpenConns)
 			db.SetMaxIdleConns(cfg.DBMaxIdleConns)
 			db.SetConnMaxLifetime(cfg.DBConnMaxLifetime)
-
-			logger.Info("✅ PostgreSQL 연결 및 Connection Pool 최적화 성공",
-				"MaxOpen", cfg.DBMaxOpenConns,
-				"MaxIdle", cfg.DBMaxIdleConns)
 			return db
 		}
-		logger.Warn("PostgreSQL 연결 재시도 중...", "attempt", i+1, "error", err)
 		time.Sleep(2 * time.Second)
 	}
-
-	logger.Error("PostgreSQL 연결 최종 실패", "error", err)
 	return nil
 }
 
@@ -104,7 +103,7 @@ func (i *Indexer) GetDB() *sql.DB {
 	return i.db
 }
 
-// SaveEvent 로직 유지
+// [혁신] SoT 1항 충족: tx_hash + log_index 멱등성 및 ON CONFLICT DO NOTHING 강제화 적용
 func (e *IndexerEngine) SaveEvent(event EventRecord) error {
 	if e.db == nil {
 		return fmt.Errorf("데이터베이스 연결 객체가 초기화되지 않았습니다")
@@ -112,16 +111,9 @@ func (e *IndexerEngine) SaveEvent(event EventRecord) error {
 
 	query := `
         INSERT INTO onchain_events (
-            block_number, tx_hash, event_type, contract_address, caller_address, raw_data
-        ) VALUES ($1, $2, $3, $4, $5, $6)
-        ON CONFLICT (tx_hash) DO UPDATE SET
-            block_number = EXCLUDED.block_number,
-            event_type = EXCLUDED.event_type,
-            raw_data = onchain_events.raw_data || EXCLUDED.raw_data
-        WHERE 
-            onchain_events.block_number IS DISTINCT FROM EXCLUDED.block_number OR
-            onchain_events.event_type IS DISTINCT FROM EXCLUDED.event_type OR
-            onchain_events.raw_data IS DISTINCT FROM EXCLUDED.raw_data;
+            block_number, tx_hash, log_index, event_type, contract_address, caller_address, raw_data
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (tx_hash, log_index) DO NOTHING;
     `
 
 	jsonData, err := json.Marshal(event.RawData)
@@ -129,8 +121,52 @@ func (e *IndexerEngine) SaveEvent(event EventRecord) error {
 		return err
 	}
 
-	_, err = e.db.Exec(query, event.BlockNumber, event.TxHash, event.EventType, event.ContractAddress, event.CallerAddress, jsonData)
+	_, err = e.db.Exec(query, event.BlockNumber, event.TxHash, event.LogIndex, event.EventType, event.ContractAddress, event.CallerAddress, jsonData)
 	return err
+}
+
+// [신규] Asynq 태스크 핸들러 (에러 격리 & 재시도 로직)
+func (e *IndexerEngine) HandleEventProcessTask(ctx context.Context, t *asynq.Task) error {
+	var event EventRecord
+	if err := json.Unmarshal(t.Payload(), &event); err != nil {
+		e.saveToDLQ(event, "Payload Parse Error: "+err.Error())
+		return nil // 치명적 에러 격리 완료, 재시도 중단
+	}
+
+	if err := e.SaveEvent(event); err != nil {
+		retryCount, _ := asynq.GetRetryCount(ctx)
+		maxRetry, _ := asynq.GetMaxRetry(ctx)
+
+		if retryCount >= maxRetry {
+			// 최대 재시도(5회) 초과 시 Dead Letter Queue 테이블로 추방
+			e.saveToDLQ(event, fmt.Sprintf("Max Retries Reached DB Error: %v", err))
+			return nil // 재시도 중단 후 안전하게 큐에서 제거
+		}
+		// 일반 에러 반환 시 Asynq가 자동으로 지수 백오프(Exponential Backoff) 재시도 수행
+		return err
+	}
+	return nil
+}
+
+// [신규] Dead Letter Queue 적재 로직
+func (e *IndexerEngine) saveToDLQ(event EventRecord, reason string) {
+	if e.db == nil {
+		return
+	}
+
+	query := `
+        INSERT INTO failed_events (
+            tx_hash, log_index, block_number, raw_log_json, error_reason, status
+        ) VALUES ($1, $2, $3, $4, $5, 'PENDING')
+        ON CONFLICT (tx_hash, log_index) DO NOTHING;
+    `
+	rawJSON, _ := json.Marshal(event.RawData)
+	_, err := e.db.Exec(query, event.TxHash, event.LogIndex, event.BlockNumber, rawJSON, reason)
+	if err != nil {
+		e.logger.Error("DLQ 적재 최종 실패 (치명적 로직 에러)", "tx", event.TxHash, "error", err)
+	} else {
+		e.logger.Warn("⚠️ 이벤트를 안전하게 DLQ로 격리했습니다", "tx", event.TxHash, "log_index", event.LogIndex, "reason", reason)
+	}
 }
 
 func (e *IndexerEngine) Start(ctx context.Context) {
@@ -140,19 +176,16 @@ func (e *IndexerEngine) Start(ctx context.Context) {
 			e.startBlock = lastSavedBlock
 		}
 	}
-	e.logger.Info("🚀 이중 동기화 엔진 가동 시작",
+	e.logger.Info("🚀 이중 동기화 엔진 가동 시작 (Asynq 멱등성 파이프라인 연동됨)",
 		"workers", e.workerCount,
-		"start_from", e.startBlock)
+		"start_from", e.startBlock,
+		"safe_margin", SafeConfirmations)
 
-	// 2. 소비자(Worker) 가동: 설정된 워커 개수만큼 병렬 실행
 	for i := 0; i < e.workerCount; i++ {
 		go e.worker(ctx, i)
 	}
 
-	// 3. 백필 생산자 가동
 	go e.historicalBackfill(ctx)
-
-	// 4. 실시간 생산자 가동
 	go e.realtimeWatcher(ctx)
 }
 
@@ -165,18 +198,19 @@ func (e *IndexerEngine) historicalBackfill(ctx context.Context) {
 		return
 	}
 
-	targetBlock := header.Number.Int64()
-	e.currentLatest.Store(targetBlock) // 워커들을 위해 원자적 최신값 갱신
+	targetBlock := header.Number.Int64() - SafeConfirmations
+	if targetBlock < 0 {
+		targetBlock = 0
+	}
+
+	e.currentLatest.Store(targetBlock)
 
 	cfg := config.New()
 	batchSize := cfg.IdxBatchSize
 	if batchSize == 0 {
-		batchSize = 2000 // 기본 안전 마진 (예: RPC 노드 최대 허용 범위)
+		batchSize = 2000
 	}
 
-	e.logger.Info("백필 대상 블록 범위", "from", e.startBlock, "to", targetBlock, "batch_size", batchSize)
-
-	// [핵심 변경] 블록 1개씩 큐에 넣는 대신, batchSize 단위로 묶어서(Chunk) 큐에 투입
 	for from := e.startBlock; from <= targetBlock; from += batchSize {
 		select {
 		case <-ctx.Done():
@@ -187,13 +221,11 @@ func (e *IndexerEngine) historicalBackfill(ctx context.Context) {
 				to = targetBlock
 			}
 
-			// 구간 단위(From~To)로 워커에게 작업 하달
 			e.taskQueue <- BlockTask{
 				FromBlock: big.NewInt(from),
 				ToBlock:   big.NewInt(to),
 			}
 
-			// 큐에 작업이 많이 쌓여있으면 백프레셔(대기) 작동 - 원본 로직 유지
 			if len(e.taskQueue) > cfg.BackfillQueueSize {
 				time.Sleep(cfg.SleepDuration * 2)
 			} else {
@@ -201,13 +233,10 @@ func (e *IndexerEngine) historicalBackfill(ctx context.Context) {
 			}
 		}
 	}
-	e.logger.Info("과거 데이터 백필 작업 큐 투입 완료")
 }
 
 func (e *IndexerEngine) realtimeWatcher(ctx context.Context) {
-	e.logger.Info("실시간 블록 모니터링 시작")
 	var lastBlock *big.Int
-
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
@@ -218,30 +247,32 @@ func (e *IndexerEngine) realtimeWatcher(ctx context.Context) {
 		case <-ticker.C:
 			header, err := e.client.GetHTTP().HeaderByNumber(ctx, nil)
 			if err != nil {
-				e.logger.Error("Watcher: 헤더 조회 실패", "error", err)
 				continue
 			}
 
-			e.currentLatest.Store(header.Number.Int64()) // 실시간 분모값 갱신
+			safeBlockNum := header.Number.Int64() - SafeConfirmations
+			if safeBlockNum < 0 {
+				safeBlockNum = 0
+			}
+			safeHeader := big.NewInt(safeBlockNum)
 
-			if lastBlock == nil || header.Number.Cmp(lastBlock) > 0 {
+			e.currentLatest.Store(safeHeader.Int64())
+
+			if lastBlock == nil || safeHeader.Cmp(lastBlock) > 0 {
 				if lastBlock != nil {
-					for i := new(big.Int).Add(lastBlock, big.NewInt(1)); i.Cmp(header.Number) <= 0; i.Add(i, big.NewInt(1)) {
+					for i := new(big.Int).Add(lastBlock, big.NewInt(1)); i.Cmp(safeHeader) <= 0; i.Add(i, big.NewInt(1)) {
 						e.taskQueue <- BlockTask{FromBlock: new(big.Int).Set(i), ToBlock: new(big.Int).Set(i)}
 					}
 				} else {
-					e.taskQueue <- BlockTask{FromBlock: header.Number, ToBlock: header.Number}
+					e.taskQueue <- BlockTask{FromBlock: safeHeader, ToBlock: safeHeader}
 				}
-				lastBlock = header.Number
-				e.logger.Debug("실시간 블록 감지", "number", lastBlock.String())
+				lastBlock = safeHeader
 			}
 		}
 	}
 }
 
-// [변경] 워커 내부에서 디코딩 로직 수행 및 병합
 func (e *IndexerEngine) worker(ctx context.Context, id int) {
-	e.logger.Info("Worker 가동", "id", id)
 	for {
 		select {
 		case <-ctx.Done():
@@ -249,16 +280,14 @@ func (e *IndexerEngine) worker(ctx context.Context, id int) {
 		case task := <-e.taskQueue:
 			query := eth.FilterQuery{
 				FromBlock: task.FromBlock,
-				ToBlock:   task.ToBlock, Addresses: []common.Address{
-					// Sepolia EAS 공식 컨트랙트 주소 (메인넷의 경우 메인넷 EAS 주소로 변경)
+				ToBlock:   task.ToBlock,
+				Addresses: []common.Address{
 					common.HexToAddress("0xC2679fBD37d54388Ce493F1DB75320D236e1815e"),
 				},
 			}
 
-			// 주의: 클라이언트는 타입 호환성 문제가 없도록 go-ethereum의 패키지 사용
 			logs, err := e.client.GetHTTP().FilterLogs(ctx, query)
 			if err != nil {
-				e.logger.Error("Worker: 로그 필터링 실패", "from_block", task.FromBlock, "to_block", task.ToBlock, "error", err)
 				continue
 			}
 
@@ -271,38 +300,38 @@ func (e *IndexerEngine) worker(ctx context.Context, id int) {
 					"index":   vLog.Index,
 				}
 
-				// [혁신] 디코더가 존재할 경우 로그를 해석 시도
 				if e.decoder != nil {
 					parsedEventName, decodedArgs, err := e.decoder.DecodeEvent(vLog)
 					if err == nil {
 						eventName = parsedEventName
-						rawDataMap["decoded_args"] = decodedArgs // 성공 시 해시맵에 병합
-						e.logger.Debug("이벤트 디코딩 성공", "event", eventName)
-					} else {
-						// 우아한 실패: 에러가 나더라도 죽지 않고 RawData만 저장
-						e.logger.Warn("이벤트 디코딩 실패 (Raw 저장 진행)", "tx", vLog.TxHash.Hex(), "error", err)
+						rawDataMap["decoded_args"] = decodedArgs
 					}
 				}
 
 				event := EventRecord{
 					BlockNumber:     int64(vLog.BlockNumber),
 					TxHash:          vLog.TxHash.Hex(),
-					EventType:       eventName, // 동적으로 파싱된 이름 적용
+					LogIndex:        int(vLog.Index), // [추가] 이벤트의 고유 위치값 추출
+					EventType:       eventName,
 					ContractAddress: vLog.Address.Hex(),
 					CallerAddress:   "",
 					RawData:         rawDataMap,
 				}
 
-				if err := e.SaveEvent(event); err != nil {
-					e.logger.Error("Worker: DB 저장 실패", "tx", event.TxHash, "error", err)
+				// [혁신] 기존 동기식 DB 저장 대신 Asynq 이벤트 큐에 적재 (생산자 역할)
+				payload, err := json.Marshal(event)
+				if err == nil {
+					asynqTask := asynq.NewTask("event:process", payload, asynq.MaxRetry(5))
+					if _, err := e.asynqClient.Enqueue(asynqTask); err != nil {
+						e.logger.Error("Worker: Asynq 큐 적재 실패", "tx", event.TxHash, "error", err)
+					}
 				}
 			}
 
+			// 이벤트 처리 실패 여부와 무관하게(Asynq 큐에 위임했으므로) 안전하게 커서 전진
 			if e.stateMgr != nil {
 				latest := e.currentLatest.Load()
-				if err := e.stateMgr.UpdateProgress(ctx, task.FromBlock.Int64(), latest); err != nil {
-					e.logger.Error("Worker: Redis 상태 업데이트 실패", "from_block", task.FromBlock, "to_block", task.ToBlock, "error", err)
-				}
+				e.stateMgr.UpdateProgress(ctx, task.ToBlock.Int64(), latest)
 			}
 		}
 	}
