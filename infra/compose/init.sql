@@ -16,6 +16,27 @@ CREATE TABLE onchain_events (
     CONSTRAINT unique_tx_hash_log_index UNIQUE (tx_hash, log_index)
 );
 
+-- 1. 장애 발생 시 에러를 격리할 Dead Letter Queue 테이블 생성
+CREATE TABLE IF NOT EXISTS failed_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),  -- [변경] 내장 함수로 교체!
+    tx_hash CHAR(66) NOT NULL,
+    log_index INT NOT NULL,
+    block_number BIGINT NOT NULL,
+    raw_log_json JSONB,
+    error_reason TEXT,
+    status VARCHAR(20) DEFAULT 'PENDING',
+    CONSTRAINT unique_failed_tx_log UNIQUE (tx_hash, log_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_failed_events_status ON failed_events(status);
+
+-- 2. 인덱서 상태 테이블 (그대로 유지)
+CREATE TABLE IF NOT EXISTS indexer_state (
+    contract_name VARCHAR(255) PRIMARY KEY,
+    last_indexed_block BIGINT NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
 -- 인덱스 최적화
 CREATE INDEX idx_onchain_events_block_number ON onchain_events(block_number);
 CREATE INDEX idx_onchain_events_event_type ON onchain_events(event_type);

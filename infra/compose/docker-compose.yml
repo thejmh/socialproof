@@ -11,7 +11,7 @@ services:
       POSTGRES_PASSWORD: ${DB_PASSWORD:-password} # .env에서 읽어온 비밀번호 주입
       POSTGRES_DB: ${DB_NAME:-socialproof} # 초기 생성될 데이터베이스 이름
     ports:
-      - "5432:5432" # 호스트PC의 5432 포트와 컨테이너의 5432 포트 연결
+      - "127.0.0.1:5432:5432" # 호스트PC의 5432 포트와 컨테이너의 5432 포트 연결
     volumes:
       - sp_postgres_data:/var/lib/postgresql/data # [중요] 데이터를 영구 저장할 볼륨 연결
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql # 컨테이너 시작 시 초기화 SQL 스크립트 자동 실행
@@ -23,7 +23,7 @@ services:
     image: redis:alpine # 초경량 Redis 이미지
     container_name: sp-redis
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     command: redis-server --requirepass ${REDIS_PASSWORD:-password123}
     networks:
       - sp-network
@@ -44,6 +44,19 @@ services:
       # 코드에서 REDIS_ADDR와 REDIS_PASSWORD를 따로 읽거나, URL 형태로 읽게 구성하세요.
       - REDIS_ADDR=sp-redis:6379
       - REDIS_PASSWORD=${REDIS_PASSWORD:-password123}
+    networks:
+      - sp-network
+
+  asynqmon:
+    image: hibiken/asynqmon:latest
+    container_name: sp-asynqmon
+    ports:
+      - "8080:8080"
+    command: 
+      - "--redis-addr=sp-redis:6379"
+      - "--redis-password=password123"
+    depends_on:
+      - redis
     networks:
       - sp-network
 
