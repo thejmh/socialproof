@@ -98,3 +98,30 @@ func (sm *StateManager) GetLastBlock(ctx context.Context) (int64, error) {
 func (sm *StateManager) Close() error {
 	return sm.client.Close()
 }
+
+// RollbackProgress는 Reorg 감지 시 커서를 강제로 이전 블록으로 되돌립니다.
+// 현재 저장된 값보다 작을 때만 업데이트하여 데이터 정합성을 보장합니다.
+func (sm *StateManager) RollbackProgress(ctx context.Context, rollbackBlock int64) error {
+	script := `
+		local key = KEYS[1]
+		local rollback_to = tonumber(ARGV[1])
+		local current = tonumber(redis.call('HGET', key, 'last_block') or '0')
+
+		-- 현재 커서보다 낮은 번호로만 롤백 허용 (강제 후진)
+		if rollback_to < current then
+			redis.call('HSET', key, 'last_block', rollback_to)
+			redis.call('HSET', key, 'updated_at', ARGV[2])
+			return 1
+		end
+		return 0
+	`
+	_, err := sm.client.Eval(ctx, script, []string{sm.stateKey},
+		rollbackBlock,
+		time.Now().Format(time.RFC3339),
+	).Result()
+
+	if err == nil {
+		sm.logger.Warn("🔄 Redis 커서 롤백 완료", "to_block", rollbackBlock)
+	}
+	return err
+}

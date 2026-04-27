@@ -28,7 +28,8 @@ const (
 type EventRecord struct {
 	BlockNumber     int64
 	TxHash          string
-	LogIndex        int // [추가] 멱등성 보장을 위한 필수 식별자
+	BlockHash       string //  Reorg 검증을 위한 블록 해시
+	LogIndex        int    //  멱등성 보장을 위한 필수 식별자
 	EventType       string
 	ContractAddress string
 	CallerAddress   string
@@ -103,7 +104,53 @@ func (i *Indexer) GetDB() *sql.DB {
 	return i.db
 }
 
-// [혁신] SoT 1항 충족: tx_hash + log_index 멱등성 및 ON CONFLICT DO NOTHING 강제화 적용
+// DB의 실제 최댓값을 기준으로 Reorg를 검증하도록 로직 변경
+func (e *IndexerEngine) checkAndHandleReorg(ctx context.Context) (bool, error) {
+	var dbBlockNum int64
+	var dbHash string
+
+	query := "SELECT block_number, block_hash FROM onchain_events ORDER BY block_number DESC LIMIT 1"
+	err := e.db.QueryRowContext(ctx, query).Scan(&dbBlockNum, &dbHash)
+	if err == sql.ErrNoRows {
+		return false, nil // 데이터가 없으면 통과
+	} else if err != nil {
+		return false, fmt.Errorf("마지막 이벤트 블록 조회 실패: %w", err)
+	}
+
+	// [핵심 방어 로직] DB에 저장된 해시가 아예 비어있다면, Reorg 검증을 건너뜁니다.
+	// (과거 마이그레이션 이전 데이터 보호용)
+	if dbHash == "" {
+		return false, nil
+	}
+
+	rpcBlock, err := e.client.GetHTTP().BlockByNumber(ctx, big.NewInt(dbBlockNum))
+	if err != nil {
+		return false, fmt.Errorf("RPC 블록 조회 실패: %w", err)
+	}
+	rpcHash := rpcBlock.Hash().Hex()
+
+	// 해시 불일치 시 롤백 실행
+	if dbHash != rpcHash {
+		e.logger.Warn("⚠️ 체인 리오그(Reorg) 감지!", "block", dbBlockNum, "db_hash", dbHash, "rpc_hash", rpcHash)
+
+		// Postgres 데이터 삭제
+		_, err = e.db.ExecContext(ctx, "DELETE FROM onchain_events WHERE block_number >= $1", dbBlockNum)
+		if err != nil {
+			return false, fmt.Errorf("DB 롤백 실패: %w", err)
+		}
+
+		if e.stateMgr != nil {
+			if err := e.stateMgr.RollbackProgress(ctx, dbBlockNum-1); err != nil {
+				return false, fmt.Errorf("Redis 롤백 실패: %w", err)
+			}
+		}
+		return true, nil
+	}
+
+	return false, nil
+}
+
+// tx_hash + log_index 멱등성 및 ON CONFLICT DO NOTHING 강제화 적용
 func (e *IndexerEngine) SaveEvent(event EventRecord) error {
 	if e.db == nil {
 		return fmt.Errorf("데이터베이스 연결 객체가 초기화되지 않았습니다")
@@ -111,17 +158,12 @@ func (e *IndexerEngine) SaveEvent(event EventRecord) error {
 
 	query := `
         INSERT INTO onchain_events (
-            block_number, tx_hash, log_index, event_type, contract_address, caller_address, raw_data
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            block_number, block_hash, tx_hash, log_index, event_type, contract_address, caller_address, raw_data
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         ON CONFLICT (tx_hash, log_index) DO NOTHING;
     `
-
-	jsonData, err := json.Marshal(event.RawData)
-	if err != nil {
-		return err
-	}
-
-	_, err = e.db.Exec(query, event.BlockNumber, event.TxHash, event.LogIndex, event.EventType, event.ContractAddress, event.CallerAddress, jsonData)
+	jsonData, _ := json.Marshal(event.RawData)
+	_, err := e.db.Exec(query, event.BlockNumber, event.BlockHash, event.TxHash, event.LogIndex, event.EventType, event.ContractAddress, event.CallerAddress, jsonData)
 	return err
 }
 
@@ -278,6 +320,17 @@ func (e *IndexerEngine) worker(ctx context.Context, id int) {
 		case <-ctx.Done():
 			return
 		case task := <-e.taskQueue:
+			// 파라미터 없이 자체 조회하는 메서드 호출
+			reorged, err := e.checkAndHandleReorg(ctx)
+			if err != nil {
+				e.logger.Error("Reorg 검사 중 오류", "err", err)
+				time.Sleep(time.Second)
+				continue
+			}
+			if reorged {
+				continue
+			}
+
 			query := eth.FilterQuery{
 				FromBlock: task.FromBlock,
 				ToBlock:   task.ToBlock,
@@ -310,6 +363,7 @@ func (e *IndexerEngine) worker(ctx context.Context, id int) {
 
 				event := EventRecord{
 					BlockNumber:     int64(vLog.BlockNumber),
+					BlockHash:       vLog.BlockHash.Hex(), // [필수 추가] 이 부분이 빠져있었을 겁니다!
 					TxHash:          vLog.TxHash.Hex(),
 					LogIndex:        int(vLog.Index), // [추가] 이벤트의 고유 위치값 추출
 					EventType:       eventName,
