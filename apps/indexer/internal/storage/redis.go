@@ -18,8 +18,8 @@ type StateManager struct {
 	stateKey   string
 }
 
-// NewStateManager는 확장성을 고려하여 ChainID를 포함한 네임스페이스를 구축합니다.
-func NewStateManager(addr, password string, chainID, startBlock int64, logger *slog.Logger) (*StateManager, error) {
+// 파라미터에 contractName을 추가하여 다중 컨트랙트 격리 환경을 구축합니다.
+func NewStateManager(addr, password string, chainID, startBlock int64, contractName string, logger *slog.Logger) (*StateManager, error) {
 	client := redis.NewClient(&redis.Options{
 		Addr:     addr,
 		Password: password,
@@ -33,14 +33,15 @@ func NewStateManager(addr, password string, chainID, startBlock int64, logger *s
 		return nil, fmt.Errorf("Redis 연결 실패: %w", err)
 	}
 
-	logger.Info("✅ Redis State Manager 연결 성공", "addr", addr)
+	logger.Info("✅ Redis State Manager 연결 성공", "addr", addr, "contract", contractName)
 
 	return &StateManager{
 		client:     client,
 		logger:     logger,
 		chainID:    chainID,
 		startBlock: startBlock,
-		stateKey:   fmt.Sprintf("sp:indexer:v1:%d:state", chainID), // 다중 체인 대응 네임스페이스
+		// 컨트랙트 이름을 키에 포함하여 서로 간섭하지 않는 완벽한 네임스페이스 구축
+		stateKey: fmt.Sprintf("sp:indexer:v1:%d:%s:state", chainID, contractName),
 	}, nil
 }
 

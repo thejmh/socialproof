@@ -7,12 +7,13 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	eth "github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/hibiken/asynq" // Asynq 추가
+	"github.com/hibiken/asynq"
 	"github.com/thejmh/socialproof/apps/indexer/internal/config"
 	"github.com/thejmh/socialproof/apps/indexer/internal/storage"
 	"github.com/thejmh/socialproof/apps/indexer/pkg/decoder"
@@ -36,33 +37,55 @@ type EventRecord struct {
 	RawData         map[string]interface{}
 }
 
+// 1. IndexerEngine 구조체에 쓰로틀링(Throttling)용 변수 추가
 type IndexerEngine struct {
+	target        config.TargetContract // 해당 엔진이 전담할 컨트랙트 정보
 	client        ethereum.Client
 	logger        *slog.Logger
 	db            *sql.DB
 	stateMgr      *storage.StateManager
 	decoder       *decoder.UniversalDecoder
-	asynqClient   *asynq.Client // [추가] 큐 적재기
+	asynqClient   *asynq.Client // 큐 적재기
 	taskQueue     chan BlockTask
 	workerCount   int
 	startBlock    int64
 	currentLatest atomic.Int64
+	//  RPC 폭격 방지용 변수
+	lastReorgCheck time.Time
+	reorgMu        sync.Mutex
 }
 
-// [변경] asynqClient 의존성 주입
-func NewIndexerEngine(client ethereum.Client, db *sql.DB, stateMgr *storage.StateManager, univDecoder *decoder.UniversalDecoder, asynqClient *asynq.Client, logger *slog.Logger, cfg *config.Config) *IndexerEngine {
+// 생성자에서 config.TargetContract를 받아 독립적으로 초기화합니다.
+func NewIndexerEngine(
+	target config.TargetContract,
+	client ethereum.Client,
+	db *sql.DB,
+	stateMgr *storage.StateManager,
+	univDecoder *decoder.UniversalDecoder,
+	asynqClient *asynq.Client,
+	logger *slog.Logger,
+	cfg *config.Config,
+) *IndexerEngine {
+	// 컨트랙트별 시작 블록 우선순위 적용 (JSON 설정 > ENV 전역 설정)
+	start := target.StartBlock
+	if start == 0 {
+		start = cfg.StartBlock
+	}
+
 	e := &IndexerEngine{
+		target:      target,
 		client:      client,
 		db:          db,
 		stateMgr:    stateMgr,
 		decoder:     univDecoder,
 		asynqClient: asynqClient,
-		logger:      logger,
+		// 로그에 어떤 컨트랙트를 처리 중인지 태그 부착
+		logger:      logger.With("contract", target.Name),
 		taskQueue:   make(chan BlockTask, cfg.BackfillQueueSize),
 		workerCount: cfg.WorkerCount,
-		startBlock:  cfg.StartBlock,
+		startBlock:  start,
 	}
-	e.currentLatest.Store(cfg.StartBlock)
+	e.currentLatest.Store(start)
 	return e
 }
 
@@ -106,19 +129,30 @@ func (i *Indexer) GetDB() *sql.DB {
 
 // DB의 실제 최댓값을 기준으로 Reorg를 검증하도록 로직 변경
 func (e *IndexerEngine) checkAndHandleReorg(ctx context.Context) (bool, error) {
+	// 다중 워커의 RPC 융단폭격(DDoS) 방지
+	// 3초 이내에 이미 다른 워커가 리오그 검사를 마쳤다면, RPC를 찌르지 않고 안전하다고 판단(Pass)합니다.
+	e.reorgMu.Lock()
+	if time.Since(e.lastReorgCheck) < 3*time.Second {
+		e.reorgMu.Unlock()
+		return false, nil
+	}
+	// 검사 시간 갱신
+	e.lastReorgCheck = time.Now()
+	e.reorgMu.Unlock()
+
 	var dbBlockNum int64
 	var dbHash string
 
-	query := "SELECT block_number, block_hash FROM onchain_events ORDER BY block_number DESC LIMIT 1"
-	err := e.db.QueryRowContext(ctx, query).Scan(&dbBlockNum, &dbHash)
+	query := "SELECT block_number, block_hash FROM onchain_events WHERE contract_address = $1 ORDER BY block_number DESC LIMIT 1"
+	// [주의] 다중 컨트랙트 환경이므로 WHERE 조건에 e.target.Address를 추가하는 것이 안전합니다!
+	err := e.db.QueryRowContext(ctx, query, e.target.Address).Scan(&dbBlockNum, &dbHash)
+
 	if err == sql.ErrNoRows {
-		return false, nil // 데이터가 없으면 통과
+		return false, nil
 	} else if err != nil {
 		return false, fmt.Errorf("마지막 이벤트 블록 조회 실패: %w", err)
 	}
 
-	// [핵심 방어 로직] DB에 저장된 해시가 아예 비어있다면, Reorg 검증을 건너뜁니다.
-	// (과거 마이그레이션 이전 데이터 보호용)
 	if dbHash == "" {
 		return false, nil
 	}
@@ -129,12 +163,10 @@ func (e *IndexerEngine) checkAndHandleReorg(ctx context.Context) (bool, error) {
 	}
 	rpcHash := rpcBlock.Hash().Hex()
 
-	// 해시 불일치 시 롤백 실행
 	if dbHash != rpcHash {
 		e.logger.Warn("⚠️ 체인 리오그(Reorg) 감지!", "block", dbBlockNum, "db_hash", dbHash, "rpc_hash", rpcHash)
 
-		// Postgres 데이터 삭제
-		_, err = e.db.ExecContext(ctx, "DELETE FROM onchain_events WHERE block_number >= $1", dbBlockNum)
+		_, err = e.db.ExecContext(ctx, "DELETE FROM onchain_events WHERE block_number >= $1 AND contract_address = $2", dbBlockNum, e.target.Address)
 		if err != nil {
 			return false, fmt.Errorf("DB 롤백 실패: %w", err)
 		}
@@ -213,12 +245,14 @@ func (e *IndexerEngine) saveToDLQ(event EventRecord, reason string) {
 
 func (e *IndexerEngine) Start(ctx context.Context) {
 	if e.stateMgr != nil {
+		// Redis 상태 관리자도 컨트랙트별로 분리된 커서를 가져와야 함 (메서드 내에서 처리된다고 가정)
 		lastSavedBlock, err := e.stateMgr.GetLastBlock(ctx)
 		if err == nil && lastSavedBlock > e.startBlock {
 			e.startBlock = lastSavedBlock
 		}
 	}
-	e.logger.Info("🚀 이중 동기화 엔진 가동 시작 (Asynq 멱등성 파이프라인 연동됨)",
+	e.logger.Info("🚀 이중 동기화 엔진 가동 시작",
+		"address", e.target.Address, // 대상 주소 로깅
 		"workers", e.workerCount,
 		"start_from", e.startBlock,
 		"safe_margin", SafeConfirmations)
@@ -320,7 +354,6 @@ func (e *IndexerEngine) worker(ctx context.Context, id int) {
 		case <-ctx.Done():
 			return
 		case task := <-e.taskQueue:
-			// 파라미터 없이 자체 조회하는 메서드 호출
 			reorged, err := e.checkAndHandleReorg(ctx)
 			if err != nil {
 				e.logger.Error("Reorg 검사 중 오류", "err", err)
@@ -331,11 +364,12 @@ func (e *IndexerEngine) worker(ctx context.Context, id int) {
 				continue
 			}
 
+			// 하드코딩된 주소 제거 -> target.Address 사용
 			query := eth.FilterQuery{
 				FromBlock: task.FromBlock,
 				ToBlock:   task.ToBlock,
 				Addresses: []common.Address{
-					common.HexToAddress("0xC2679fBD37d54388Ce493F1DB75320D236e1815e"),
+					common.HexToAddress(e.target.Address),
 				},
 			}
 
@@ -363,16 +397,15 @@ func (e *IndexerEngine) worker(ctx context.Context, id int) {
 
 				event := EventRecord{
 					BlockNumber:     int64(vLog.BlockNumber),
-					BlockHash:       vLog.BlockHash.Hex(), // [필수 추가] 이 부분이 빠져있었을 겁니다!
+					BlockHash:       vLog.BlockHash.Hex(),
 					TxHash:          vLog.TxHash.Hex(),
-					LogIndex:        int(vLog.Index), // [추가] 이벤트의 고유 위치값 추출
+					LogIndex:        int(vLog.Index),
 					EventType:       eventName,
 					ContractAddress: vLog.Address.Hex(),
 					CallerAddress:   "",
 					RawData:         rawDataMap,
 				}
 
-				// [혁신] 기존 동기식 DB 저장 대신 Asynq 이벤트 큐에 적재 (생산자 역할)
 				payload, err := json.Marshal(event)
 				if err == nil {
 					asynqTask := asynq.NewTask("event:process", payload, asynq.MaxRetry(5))
@@ -382,7 +415,6 @@ func (e *IndexerEngine) worker(ctx context.Context, id int) {
 				}
 			}
 
-			// 이벤트 처리 실패 여부와 무관하게(Asynq 큐에 위임했으므로) 안전하게 커서 전진
 			if e.stateMgr != nil {
 				latest := e.currentLatest.Load()
 				e.stateMgr.UpdateProgress(ctx, task.ToBlock.Int64(), latest)

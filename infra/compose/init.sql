@@ -18,7 +18,7 @@ CREATE TABLE onchain_events (
 
 -- 1. 장애 발생 시 에러를 격리할 Dead Letter Queue 테이블 생성
 CREATE TABLE IF NOT EXISTS failed_events (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),  -- [변경] 내장 함수로 교체!
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),  -- 내장 함수로 교체!
     tx_hash CHAR(66) NOT NULL,
     log_index INT NOT NULL,
     block_number BIGINT NOT NULL,

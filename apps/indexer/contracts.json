@@ -1,0 +1,14 @@
+[
+  {
+    "name": "EAS_Sepolia",
+    "address": "0xC2679fBD37d54388Ce493F1DB75320D236e1815e",
+    "start_block": 5710000,
+    "abi_string": "[{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"address\",\"name\":\"recipient\",\"type\":\"address\"},{\"indexed\":true,\"internalType\":\"address\",\"name\":\"attester\",\"type\":\"address\"},{\"indexed\":false,\"internalType\":\"bytes32\",\"name\":\"uid\",\"type\":\"bytes32\"},{\"indexed\":true,\"internalType\":\"bytes32\",\"name\":\"schema\",\"type\":\"bytes32\"}],\"name\":\"Attested\",\"type\":\"event\"}]"
+  },
+  {
+    "name": "CampaignEscrow",
+    "address": "0x1111111111111111111111111111111111111111",
+    "start_block": 5715000,
+    "abi_string": "[]"
+  }
+]

@@ -6,10 +6,10 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
-	"time"
 
-	"github.com/hibiken/asynq" // Asynq 추가
+	"github.com/hibiken/asynq"
 	"github.com/joho/godotenv"
 	"github.com/thejmh/socialproof/apps/indexer/internal/config"
 	"github.com/thejmh/socialproof/apps/indexer/internal/engine"
@@ -17,8 +17,6 @@ import (
 	"github.com/thejmh/socialproof/apps/indexer/pkg/decoder"
 	"github.com/thejmh/socialproof/apps/indexer/pkg/ethereum"
 )
-
-const easAttestedABI = `[{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"recipient","type":"address"},{"indexed":true,"internalType":"address","name":"attester","type":"address"},{"indexed":false,"internalType":"bytes32","name":"uid","type":"bytes32"},{"indexed":true,"internalType":"bytes32","name":"schema","type":"bytes32"}],"name":"Attested","type":"event"}]`
 
 func main() {
 	if err := godotenv.Load(); err != nil {
@@ -49,13 +47,6 @@ func main() {
 	sqlDB := dbInstance.GetDB()
 	defer sqlDB.Close()
 
-	stateMgr, err := storage.NewStateManager(cfg.RedisAddr, cfg.RedisPassword, cfg.ChainID, cfg.StartBlock, logger)
-	if err != nil {
-		logger.Error("Redis 초기화 실패", "error", err)
-		os.Exit(1)
-	}
-	defer stateMgr.Close()
-
 	client, err := ethereum.NewClient(ctx, cfg.EthRPCURL, cfg.EthWSURL, logger)
 	if err != nil {
 		logger.Error("EVM 클라이언트 초기화 실패", "error", err)
@@ -63,27 +54,59 @@ func main() {
 	}
 	defer client.Close()
 
-	univDecoder, err := decoder.NewUniversalDecoder(easAttestedABI)
-	if err != nil {
-		logger.Error("디코더 초기화 실패", "error", err)
-		os.Exit(1)
-	}
-	logger.Info("✅ 범용 동적 디코더 엔진 초기화 성공")
-
-	// [신규] Asynq 클라이언트 및 서버 초기화
 	asynqOpt := asynq.RedisClientOpt{Addr: cfg.RedisAddr, Password: cfg.RedisPassword}
 	asynqClient := asynq.NewClient(asynqOpt)
 	defer asynqClient.Close()
 
-	// 파라미터에 asynqClient 추가 주입
-	indexer := engine.NewIndexerEngine(client, sqlDB, stateMgr, univDecoder, asynqClient, logger, cfg)
+	// 단일 엔진 생성이 아닌, 다중 엔진 스포닝
+	var wg sync.WaitGroup
+	var activeEngines []*engine.IndexerEngine
 
-	// [신규] Asynq 백그라운드 서버 가동 (소비자 역할)
+	for _, contract := range cfg.Contracts {
+		// 1. 컨트랙트별 독립적인 StateManager (커서 키 분리)
+		// 참고: storage.NewStateManager 내부에서 contract.Name 을 접두사로 사용하도록 수정 권장
+		stateMgr, err := storage.NewStateManager(
+			cfg.RedisAddr,
+			cfg.RedisPassword,
+			cfg.ChainID,
+			contract.StartBlock,
+			contract.Name, // <--- 이 부분이 추가되었습니다!
+			logger.With("contract", contract.Name),
+		)
+		if err != nil {
+			logger.Error("Redis 초기화 실패", "contract", contract.Name, "error", err)
+			continue
+		}
+		defer stateMgr.Close()
+
+		// 2. 컨트랙트별 독립적인 Decoder 생성
+		var univDecoder *decoder.UniversalDecoder
+		if contract.AbiString != "" {
+			univDecoder, err = decoder.NewUniversalDecoder(contract.AbiString)
+			if err != nil {
+				logger.Error("디코더 초기화 실패", "contract", contract.Name, "error", err)
+				// 디코더가 없어도 생데이터 수집을 위해 계속 진행할 수 있음
+			}
+		}
+
+		// 3. 엔진 생성 및 보관
+		idxEngine := engine.NewIndexerEngine(contract, client, sqlDB, stateMgr, univDecoder, asynqClient, logger, cfg)
+		activeEngines = append(activeEngines, idxEngine)
+	}
+
+	if len(activeEngines) == 0 {
+		logger.Error("실행할 컨트랙트 엔진이 없습니다. contracts.json을 확인하세요.")
+		os.Exit(1)
+	}
+
+	// [공용] Asynq 소비자 서버 가동 (여러 엔진이 넣은 작업을 처리)
 	asynqSrv := asynq.NewServer(asynqOpt, asynq.Config{
-		Concurrency: cfg.WorkerCount, // 큐 처리 워커 수 설정
+		Concurrency: cfg.WorkerCount * len(activeEngines), // 엔진 수에 비례하여 워커 증가
 	})
 	mux := asynq.NewServeMux()
-	mux.HandleFunc("event:process", indexer.HandleEventProcessTask) // 큐 라우팅
+
+	// 편의상 첫 번째 엔진의 Handler를 사용 (어느 엔진이든 DB 저장 로직은 동일함)
+	mux.HandleFunc("event:process", activeEngines[0].HandleEventProcessTask)
 
 	go func() {
 		if err := asynqSrv.Run(mux); err != nil {
@@ -92,21 +115,26 @@ func main() {
 	}()
 	defer asynqSrv.Stop()
 
-	go indexer.Start(ctx)
+	// [실행] 구성된 모든 엔진을 동시에 가동
+	for _, eng := range activeEngines {
+		wg.Add(1)
+		go func(e *engine.IndexerEngine) {
+			defer wg.Done()
+			e.Start(ctx)
+		}(eng)
+	}
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	logger.Info("SocialProof 인덱서 시스템 가동 중...",
+	logger.Info("🌐 SocialProof 다중 컨트랙트 인덱서 시스템 가동 중...",
 		"rpc", cfg.EthRPCURL,
-		"db", "connected",
-		"redis_asynq", "connected",
-		"log_level", logLevel.String(),
+		"active_engines", len(activeEngines),
 	)
 
 	sig := <-sigChan
 	logger.Info("셧다운 신호 수신", "signal", sig.String())
 	cancel()
-	time.Sleep(1 * time.Second)
+	wg.Wait() // 모든 엔진이 종료될 때까지 대기
 	logger.Info("인덱서가 안전하게 종료되었습니다.")
 }
