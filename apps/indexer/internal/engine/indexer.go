@@ -130,13 +130,11 @@ func (i *Indexer) GetDB() *sql.DB {
 // DB의 실제 최댓값을 기준으로 Reorg를 검증하도록 로직 변경
 func (e *IndexerEngine) checkAndHandleReorg(ctx context.Context) (bool, error) {
 	// 다중 워커의 RPC 융단폭격(DDoS) 방지
-	// 3초 이내에 이미 다른 워커가 리오그 검사를 마쳤다면, RPC를 찌르지 않고 안전하다고 판단(Pass)합니다.
 	e.reorgMu.Lock()
 	if time.Since(e.lastReorgCheck) < 3*time.Second {
 		e.reorgMu.Unlock()
 		return false, nil
 	}
-	// 검사 시간 갱신
 	e.lastReorgCheck = time.Now()
 	e.reorgMu.Unlock()
 
@@ -144,7 +142,6 @@ func (e *IndexerEngine) checkAndHandleReorg(ctx context.Context) (bool, error) {
 	var dbHash string
 
 	query := "SELECT block_number, block_hash FROM onchain_events WHERE contract_address = $1 ORDER BY block_number DESC LIMIT 1"
-	// [주의] 다중 컨트랙트 환경이므로 WHERE 조건에 e.target.Address를 추가하는 것이 안전합니다!
 	err := e.db.QueryRowContext(ctx, query, e.target.Address).Scan(&dbBlockNum, &dbHash)
 
 	if err == sql.ErrNoRows {
@@ -199,12 +196,11 @@ func (e *IndexerEngine) SaveEvent(event EventRecord) error {
 	return err
 }
 
-// [신규] Asynq 태스크 핸들러 (에러 격리 & 재시도 로직)
 func (e *IndexerEngine) HandleEventProcessTask(ctx context.Context, t *asynq.Task) error {
 	var event EventRecord
 	if err := json.Unmarshal(t.Payload(), &event); err != nil {
 		e.saveToDLQ(event, "Payload Parse Error: "+err.Error())
-		return nil // 치명적 에러 격리 완료, 재시도 중단
+		return nil
 	}
 
 	if err := e.SaveEvent(event); err != nil {
@@ -212,17 +208,14 @@ func (e *IndexerEngine) HandleEventProcessTask(ctx context.Context, t *asynq.Tas
 		maxRetry, _ := asynq.GetMaxRetry(ctx)
 
 		if retryCount >= maxRetry {
-			// 최대 재시도(5회) 초과 시 Dead Letter Queue 테이블로 추방
 			e.saveToDLQ(event, fmt.Sprintf("Max Retries Reached DB Error: %v", err))
-			return nil // 재시도 중단 후 안전하게 큐에서 제거
+			return nil
 		}
-		// 일반 에러 반환 시 Asynq가 자동으로 지수 백오프(Exponential Backoff) 재시도 수행
 		return err
 	}
 	return nil
 }
 
-// [신규] Dead Letter Queue 적재 로직
 func (e *IndexerEngine) saveToDLQ(event EventRecord, reason string) {
 	if e.db == nil {
 		return
@@ -245,14 +238,13 @@ func (e *IndexerEngine) saveToDLQ(event EventRecord, reason string) {
 
 func (e *IndexerEngine) Start(ctx context.Context) {
 	if e.stateMgr != nil {
-		// Redis 상태 관리자도 컨트랙트별로 분리된 커서를 가져와야 함 (메서드 내에서 처리된다고 가정)
 		lastSavedBlock, err := e.stateMgr.GetLastBlock(ctx)
 		if err == nil && lastSavedBlock > e.startBlock {
 			e.startBlock = lastSavedBlock
 		}
 	}
 	e.logger.Info("🚀 이중 동기화 엔진 가동 시작",
-		"address", e.target.Address, // 대상 주소 로깅
+		"address", e.target.Address,
 		"workers", e.workerCount,
 		"start_from", e.startBlock,
 		"safe_margin", SafeConfirmations)
@@ -364,7 +356,13 @@ func (e *IndexerEngine) worker(ctx context.Context, id int) {
 				continue
 			}
 
-			// 하드코딩된 주소 제거 -> target.Address 사용
+			targetAddr := e.target.Address
+			if targetAddr == "" {
+				targetAddr = "경고: 주소 비어있음!"
+			}
+
+			//e.logger.Info("📡 [RPC 쿼리 전송]", "address", targetAddr, "from", task.FromBlock.String(), "to", task.ToBlock.String())
+
 			query := eth.FilterQuery{
 				FromBlock: task.FromBlock,
 				ToBlock:   task.ToBlock,
@@ -374,7 +372,11 @@ func (e *IndexerEngine) worker(ctx context.Context, id int) {
 			}
 
 			logs, err := e.client.GetHTTP().FilterLogs(ctx, query)
+
+			//e.logger.Info("📥 [RPC 응답 결과]", "address", targetAddr, "log_count", len(logs), "error", err)
+
 			if err != nil {
+				time.Sleep(time.Second) // 에러 시 폭주 방지
 				continue
 			}
 
@@ -421,4 +423,65 @@ func (e *IndexerEngine) worker(ctx context.Context, id int) {
 			}
 		}
 	}
+}
+
+// ----------------------------------------------------------------------
+// [신규] API Bridge 용 제어 평면 (Control Plane) 로직 추가
+// ----------------------------------------------------------------------
+
+// ReprocessRange는 관리자가 요청한 블록 구간을 기존 worker queue에 삽입하여 비동기로 재처리합니다.
+// 멱등성 보장 원칙에 의해 중복 데이터는 안전하게 무시됩니다.
+func (e *IndexerEngine) ReprocessRange(ctx context.Context, fromBlock, toBlock int64) {
+	e.taskQueue <- BlockTask{
+		FromBlock: big.NewInt(fromBlock),
+		ToBlock:   big.NewInt(toBlock),
+	}
+	e.logger.Info("🛠️ 수동 블록 구간 재처리 명령 큐 적재 완료", "from", fromBlock, "to", toBlock)
+}
+
+// ProcessSingleLog는 격리된 DLQ 원본 데이터를 다시 꺼내어 즉시 투영을 재시도합니다.
+func (e *IndexerEngine) ProcessSingleLog(ctx context.Context, eventID string) error {
+	var txHash string
+	var logIndex int
+	var blockNum int64
+	var rawJson []byte
+
+	query := `SELECT tx_hash, log_index, block_number, raw_log_json FROM failed_events WHERE id = $1 AND status = 'PENDING'`
+	err := e.db.QueryRowContext(ctx, query, eventID).Scan(&txHash, &logIndex, &blockNum, &rawJson)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("대기 중(PENDING)인 실패 이벤트를 찾을 수 없습니다: %s", eventID)
+		}
+		return fmt.Errorf("failed_events DB 조회 실패: %w", err)
+	}
+
+	var rawData map[string]interface{}
+	if err := json.Unmarshal(rawJson, &rawData); err != nil {
+		return fmt.Errorf("저장된 원본 데이터(JSON) 언마샬링 실패: %w", err)
+	}
+
+	// 수동 재시도용 임시 EventRecord 구성
+	event := EventRecord{
+		BlockNumber:     blockNum,
+		TxHash:          txHash,
+		LogIndex:        logIndex,
+		RawData:         rawData,
+		ContractAddress: e.target.Address,
+		// 추가적 디코딩 로직이 필요하다면 여기서 rawData의 topics/data를 분석하여 덮어씌움
+	}
+
+	// 1. 직접 DB 투영 시도 (동기적 피드백 제공)
+	if err := e.SaveEvent(event); err != nil {
+		return fmt.Errorf("이벤트 재처리 및 저장 실패: %w", err)
+	}
+
+	// 2. 성공 시 RESOLVED 상태 업데이트
+	updateQ := `UPDATE failed_events SET status = 'RESOLVED' WHERE id = $1`
+	_, err = e.db.ExecContext(ctx, updateQ, eventID)
+	if err != nil {
+		e.logger.Error("재처리 성공 후 상태 업데이트 실패 (데이터는 저장됨)", "id", eventID, "err", err)
+	}
+
+	e.logger.Info("🛠️ DLQ 이벤트 수동 복구 완료", "tx", txHash, "log_index", logIndex)
+	return nil
 }
